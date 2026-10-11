@@ -103,22 +103,37 @@ bool SilSystem::running() const { return impl_->running.load(); }
 void SilSystem::set_sensor(const SensorId id, const std::uint16_t value) {
   // TODO(candidate): protect state.sensors with state.mutex and store value.
   // SensorId::Count is not a valid sensor and does not need to be accepted.
-  (void)id;
-  (void)value;
+  if (id >= SensorId::Count) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(impl_->state.mutex);
+  impl_->state.sensors[sensor_index(id)] = value;
+
 }
 
 std::uint16_t SilSystem::output(const OutputId id) const {
   // TODO(candidate): protect state.outputs with state.mutex and return the
   // requested value.
-  (void)id;
-  return 0U;
+  std::lock_guard<std::mutex> lock(impl_->state.mutex);
+  return impl_->state.outputs[output_index(id)];
 }
 
 void SilSystem::send_frame(const Frame& frame) {
   // TODO(candidate): protect state.ebs_input with state.mutex and enqueue the
   // frame. If the queue reaches kQueueCapacity, discard the oldest input
   // before adding the new one.
-  (void)frame;
+  
+  std::lock_guard<std::mutex> lock(impl_->state.mutex);
+  // To guarantee strong exception safety and avoid failures on memory allocation (std::bad_alloc)
+  // the new frame is inserted before enforcing the capacity limit.
+  // So, if memory allocation fails, the queue is left completely unmodified and no frames are lost.
+  
+  impl_->state.ebs_input.push_back(frame);
+  
+  if (impl_->state.ebs_input.size() > kQueueCapacity) {
+    impl_->state.ebs_input.pop_front();
+  }
+
 }
 
 bool SilSystem::receive_frame(Frame& frame,
@@ -126,9 +141,7 @@ bool SilSystem::receive_frame(Frame& frame,
   // TODO(candidate): acquire state.mutex with a std::unique_lock and wait on
   // state.emitted_available until state.emitted is non-empty or timeout
   // expires. On success, move the oldest frame to frame.
-  (void)frame;
-  (void)timeout;
-  return false;
+  std::unique_lock<std::mutex> lock(impl_->state.mutex);
 }
 
 std::uint16_t SilSystem::read_sensor(const SensorId id) const {
