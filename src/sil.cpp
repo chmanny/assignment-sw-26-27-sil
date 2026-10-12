@@ -87,6 +87,13 @@ void SilSystem::stop() {
   }
 
   impl_->stop_requested.store(true);
+
+  // wake up any threads waiting for a frame to be emitted so they can exit
+  {
+    std::lock_guard<std::mutex> lock(impl_->state.mutex);
+    impl_->state.emitted_available.notify_all();
+  }
+
   if (impl_->smu_thread.joinable()) {
     impl_->smu_thread.join();
   }
@@ -142,21 +149,36 @@ bool SilSystem::receive_frame(Frame& frame,
   // state.emitted_available until state.emitted is non-empty or timeout
   // expires. On success, move the oldest frame to frame.
   std::unique_lock<std::mutex> lock(impl_->state.mutex);
+  // wait_for with a predicate is used to avoid spurious wakeups
+  // stop_requested is checked to avoid waiting if the system is stopped while waiting for a frame
+  bool success = impl_->state.emitted_available.wait_for(lock, timeout, [this] {
+    return !impl_->state.emitted.empty() || impl_->stop_requested.load();
+  });
+  if (!success || impl_->state.emitted.empty()) {
+    return false;
+  }
+  frame = std::move(impl_->state.emitted.front());
+  impl_->state.emitted.pop_front();
+  return true;
 }
 
 std::uint16_t SilSystem::read_sensor(const SensorId id) const {
   // TODO(candidate): protect state.sensors with state.mutex and return the
   // requested value.
-  (void)id;
-  return 0U;
+  std::lock_guard<std::mutex> lock(impl_->state.mutex);
+  return impl_->state.sensors[sensor_index(id)];
 }
 
 bool SilSystem::try_read(const Ecu ecu, Frame& frame) {
   // TODO(candidate): protect state.ebs_input with state.mutex. Only Ecu::Ebs
   // has an input queue in this exercise. If it is empty, return false;
   // otherwise pop its oldest frame.
-  (void)ecu;
-  (void)frame;
+  std::lock_guard<std::mutex> lock(impl_->state.mutex);
+  if (ecu == Ecu::Ebs && !impl_->state.ebs_input.empty()) {
+    frame = std::move(impl_->state.ebs_input.front());
+    impl_->state.ebs_input.pop_front();
+    return true;
+  }
   return false;
 }
 
@@ -165,15 +187,29 @@ void SilSystem::write(const Ecu ecu, const Frame& frame) {
   // goes to state.emitted. A frame written by the SMU must also be copied to
   // state.ebs_input. Keep both queues bounded by kQueueCapacity, then notify
   // waiting test code through state.emitted_available.
-  (void)ecu;
-  (void)frame;
+  std::lock_guard<std::mutex> lock(impl_->state.mutex);
+  // To guarantee strong exception safety and avoid failures on memory allocation (std::bad_alloc)
+  // the new frame is inserted before enforcing the capacity limit.
+  // So, if memory allocation fails, the queue is left completely unmodified and no frames are lost.
+  impl_->state.emitted.push_back(frame);
+  if (ecu == Ecu::Smu) {
+    impl_->state.ebs_input.push_back(frame);
+  }
+  // Enforce the capacity limit on both queues.
+  if (impl_->state.emitted.size() > kQueueCapacity) {
+    impl_->state.emitted.pop_front();
+  }
+  if (impl_->state.ebs_input.size() > kQueueCapacity) {
+    impl_->state.ebs_input.pop_front();
+  }
+  impl_->state.emitted_available.notify_one();
 }
 
 void SilSystem::write_output(const Ecu /*ecu*/, const OutputId id,
                              const std::uint16_t value) {
   // TODO(candidate): protect state.outputs with state.mutex and store value.
-  (void)id;
-  (void)value;
+  std::lock_guard<std::mutex> lock(impl_->state.mutex);
+  impl_->state.outputs[output_index(id)] = value;
 }
 
 namespace ecu_io {
