@@ -47,10 +47,6 @@ bool wait_for_matching_frame(SilSystem& system, const std::uint32_t id,
   return false;
 }
 
-bool wait_for_frame(SilSystem& system, const std::uint32_t id, Frame& result) {
-  return wait_for_matching_frame(
-      system, id, [](const Frame&) { return true; }, result);
-}
 
 Frame vehicle_status(const bool manual, const bool ready_to_drive,
                      const std::uint8_t speed) {
@@ -154,13 +150,114 @@ bool wait_for_ebs_status_with_refresh(
                                          timeout, refresh_interval);
 }
 
+bool is_smu_sense_frame(const Frame& f, const std::uint8_t throttle,
+                        const std::uint8_t brake, const std::uint8_t fault) {
+  return f.dlc == 3U && f.data[0] == throttle && f.data[1] == brake &&
+         f.data[2] == fault;
+}
+
+void expect_smu_outputs(TestContext& context, const SilSystem& system,
+                        const std::uint16_t throttle, const std::uint16_t brake) {
+  context.expect(system.output(OutputId::SmuThrottlePercent) == throttle,
+                 "SMU throttle output is {} percent", throttle);
+  context.expect(system.output(OutputId::SmuBrakePercent) == brake,
+                 "SMU brake output is {} percent", brake);
+}
+
+bool is_ebs_nominal_frame(const Frame& f, const std::uint8_t expected_speed = 0U) {
+  return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
+         f.data[2] == 0U && f.data[3] == 0U && f.data[4] == expected_speed;
+}
+
+bool is_ebs_safe_frame(const Frame& f, const std::uint8_t expected_fault) {
+  return f.dlc == 5U && f.data[0] == 0U && f.data[1] == 1U &&
+         f.data[2] == 1U && f.data[3] == expected_fault;
+}
+
+bool wait_for_ebs_nominal(
+    SilSystem& system, Frame& result, const EbsInputs& inputs = {},
+    const std::chrono::milliseconds timeout = std::chrono::milliseconds(800)) {
+  return wait_for_ebs_status_with_inputs(
+      system, inputs, [](const Frame& f) { return is_ebs_nominal_frame(f); },
+      result, timeout);
+}
+
+bool wait_for_ebs_safe(
+    SilSystem& system, const std::uint8_t expected_fault, Frame& result,
+    const EbsInputs& inputs = {},
+    const std::chrono::milliseconds timeout = std::chrono::milliseconds(800)) {
+  return wait_for_ebs_status_with_inputs(
+      system, inputs,
+      [expected_fault](const Frame& f) {
+        return is_ebs_safe_frame(f, expected_fault);
+      },
+      result, timeout);
+}
+
+void expect_ebs_nominal_outputs(TestContext& context, const SilSystem& system,
+                                const std::string_view tag = "") {
+  if (tag.empty()) {
+    context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
+                   "EBS closes ASNode in nominal state");
+    context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
+                   "EBS valve 1 is disengaged in nominal state");
+    context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
+                   "EBS valve 2 is disengaged in nominal state");
+    context.expect(system.output(OutputId::EbsFaultCode) == 0U,
+                   "EBS fault code is 0 in nominal state");
+  } else {
+    context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
+                   "[{}]: EBS closes ASNode in nominal state", tag);
+    context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
+                   "[{}]: EBS valve 1 is disengaged in nominal state", tag);
+    context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
+                   "[{}]: EBS valve 2 is disengaged in nominal state", tag);
+    context.expect(system.output(OutputId::EbsFaultCode) == 0U,
+                   "[{}]: EBS fault code is 0 in nominal state", tag);
+  }
+}
+
+void expect_ebs_safe_outputs(TestContext& context, const SilSystem& system,
+                             const std::uint16_t expected_fault,
+                             const std::string_view tag = "") {
+  if (tag.empty()) {
+    context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
+                   "EBS opens ASNode in safe state");
+    context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
+                   "EBS valve 1 is engaged in safe state");
+    context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
+                   "EBS valve 2 is engaged in safe state");
+    context.expect(system.output(OutputId::EbsFaultCode) == expected_fault,
+                   "EBS output fault code is {} (safe state)", expected_fault);
+  } else {
+    context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
+                   "[{}]: EBS opens ASNode in safe state", tag);
+    context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
+                   "[{}]: EBS valve 1 is engaged in safe state", tag);
+    context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
+                   "[{}]: EBS valve 2 is engaged in safe state", tag);
+    context.expect(system.output(OutputId::EbsFaultCode) == expected_fault,
+                   "[{}]: EBS output fault code is {} (safe state)", tag,
+                   expected_fault);
+  }
+}
 
 void test_lifecycle(TestContext& context) {
   SilSystem system;
   context.expect(system.start(), "SIL starts");
   context.expect(system.running(), "SIL reports running");
+
+  // Point 5: Concurrent start on another instance must be rejected while an instance is active
+  SilSystem second_system;
+  context.expect(!second_system.start(),
+                 "Concurrent SilSystem::start() is rejected when another instance is active");
+
   system.stop();
   context.expect(!system.running(), "SIL stops and joins its threads");
+
+  // Redundant stop() calls should be idempotent, safe and non-blocking
+  system.stop();
+  context.expect(!system.running(), "SIL redundant stop() is idempotent");
 }
 
 void configure_nominal_inputs(SilSystem& system) {
@@ -170,6 +267,33 @@ void configure_nominal_inputs(SilSystem& system) {
   system.set_sensor(SensorId::EbsValvesPowered, 1U);
   system.set_sensor(SensorId::EbsAsmsActive, 1U);
   system.set_sensor(SensorId::EbsWatchdogHealthy, 1U);
+}
+
+void test_lifecycle_restart_clears_state(TestContext& context) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+  context.expect(system.start(), "SIL starts for restart state-clearing test");
+  Frame nominal{};
+  context.expect(wait_for_ebs_nominal(system, nominal),
+                 "EBS reaches nominal state in run 1");
+  system.stop();
+  context.expect(!system.running(), "SIL stops after run 1");
+
+  // Restart the system without publishing any CAN frames.
+  // Because stop() clears ebs_input, emitted, and outputs, the EBS must NOT consume
+  // stale frames from the previous run; it must immediately report communication fault 1.
+  context.expect(system.start(), "SIL restarts cleanly in run 2");
+  Frame safe_frame{};
+  const bool safe_received = wait_for_matching_frame(
+      system, raceup::sil::can_id::EbsStatus,
+      [](const Frame& f) { return is_ebs_safe_frame(f, 1U); }, safe_frame);
+  context.expect(
+      safe_received,
+      "EBS starts in safe state (fault 1) on restart because previous queues were cleared");
+  if (safe_received) {
+    expect_ebs_safe_outputs(context, system, 1U, "restart without inputs");
+  }
+  system.stop();
 }
 
 void test_smu_nominal(TestContext& context) {
@@ -182,20 +306,13 @@ void test_smu_nominal(TestContext& context) {
   }
 
   Frame frame{};
-  const bool received = wait_for_frame(
-      system, raceup::sil::can_id::SmuSense, frame);
+  const bool received = wait_for_matching_frame(
+      system, raceup::sil::can_id::SmuSense,
+      [](const Frame& f) { return is_smu_sense_frame(f, 50U, 50U, 0U); },
+      frame);
   context.expect(received, "SMU publishes a nominal sense frame");
   if (received) {
-    context.expect(frame.dlc == 3U, "SMU sense frame has DLC 3");
-    context.expect(frame.data[0] == 50U,
-                   "SMU publishes exactly 50 percent throttle");
-    context.expect(frame.data[1] == 50U,
-                   "SMU publishes exactly 50 percent brake");
-    context.expect(frame.data[2] == 0U, "SMU reports no APP fault");
-    context.expect(system.output(OutputId::SmuThrottlePercent) == 50U,
-                   "SMU throttle output is 50 percent");
-    context.expect(system.output(OutputId::SmuBrakePercent) == 50U,
-                   "SMU brake output is 50 percent");
+    expect_smu_outputs(context, system, 50U, 50U);
   }
 
   system.stop();
@@ -213,10 +330,7 @@ void test_smu_track_short_and_recovery(TestContext& context) {
   Frame nominal{};
   const bool nominal_received = wait_for_matching_frame(
       system, raceup::sil::can_id::SmuSense,
-      [](const Frame& candidate) {
-        return candidate.dlc == 3U && candidate.data[0] == 50U &&
-               candidate.data[1] == 50U && candidate.data[2] == 0U;
-      },
+      [](const Frame& f) { return is_smu_sense_frame(f, 50U, 50U, 0U); },
       nominal);
   context.expect(nominal_received,
                  "SMU reaches the nominal state before the live fault");
@@ -230,10 +344,7 @@ void test_smu_track_short_and_recovery(TestContext& context) {
   Frame fault{};
   const bool fault_received = wait_for_matching_frame(
       system, raceup::sil::can_id::SmuSense,
-      [](const Frame& candidate) {
-        return candidate.dlc == 3U && candidate.data[0] == 0U &&
-               candidate.data[1] == 50U && candidate.data[2] == 1U;
-      },
+      [](const Frame& f) { return is_smu_sense_frame(f, 0U, 50U, 1U); },
       fault);
   context.expect(fault_received,
                  "SMU reports a track-short fault and inhibits throttle");
@@ -241,26 +352,19 @@ void test_smu_track_short_and_recovery(TestContext& context) {
     system.stop();
     return;
   }
-  context.expect(system.output(OutputId::SmuThrottlePercent) == 0U,
-                 "SMU throttle output is inhibited");
-  context.expect(system.output(OutputId::SmuBrakePercent) == 50U,
-                 "SMU brake output remains unchanged during the APP fault");
+  expect_smu_outputs(context, system, 0U, 50U);
 
   system.set_sensor(SensorId::SmuApps1Raw, 3250U);
   system.set_sensor(SensorId::SmuApps2Raw, 2750U);
   Frame recovered{};
   const bool recovered_received = wait_for_matching_frame(
       system, raceup::sil::can_id::SmuSense,
-      [](const Frame& candidate) {
-        return candidate.dlc == 3U && candidate.data[0] == 75U &&
-               candidate.data[1] == 50U && candidate.data[2] == 0U;
-      },
+      [](const Frame& f) { return is_smu_sense_frame(f, 75U, 50U, 0U); },
       recovered);
   context.expect(recovered_received,
                  "SMU clears the fault and follows the restored pedals");
   if (recovered_received) {
-    context.expect(system.output(OutputId::SmuThrottlePercent) == 75U,
-                   "SMU throttle output recovers to 75 percent");
+    expect_smu_outputs(context, system, 75U, 50U);
   }
 
   system.stop();
@@ -278,10 +382,7 @@ void test_smu_implausibility_and_recovery(TestContext& context) {
   Frame nominal{};
   const bool nominal_received = wait_for_matching_frame(
       system, raceup::sil::can_id::SmuSense,
-      [](const Frame& candidate) {
-        return candidate.dlc == 3U && candidate.data[0] == 50U &&
-               candidate.data[1] == 50U && candidate.data[2] == 0U;
-      },
+      [](const Frame& f) { return is_smu_sense_frame(f, 50U, 50U, 0U); },
       nominal);
   context.expect(nominal_received,
                  "SMU reaches the nominal state before the plausibility fault");
@@ -295,10 +396,7 @@ void test_smu_implausibility_and_recovery(TestContext& context) {
   Frame fault{};
   const bool fault_received = wait_for_matching_frame(
       system, raceup::sil::can_id::SmuSense,
-      [](const Frame& candidate) {
-        return candidate.dlc == 3U && candidate.data[0] == 0U &&
-               candidate.data[1] == 50U && candidate.data[2] == 2U;
-      },
+      [](const Frame& f) { return is_smu_sense_frame(f, 0U, 50U, 2U); },
       fault);
   context.expect(fault_received,
                  "SMU reports an implausibility fault and inhibits throttle");
@@ -306,27 +404,131 @@ void test_smu_implausibility_and_recovery(TestContext& context) {
     system.stop();
     return;
   }
-  context.expect(system.output(OutputId::SmuThrottlePercent) == 0U,
-                 "SMU throttle output is inhibited on implausibility");
-  context.expect(
-      system.output(OutputId::SmuBrakePercent) == 50U,
-      "SMU brake output remains unchanged during the plausibility fault");
+  expect_smu_outputs(context, system, 0U, 50U);
 
   system.set_sensor(SensorId::SmuApps1Raw, 3250U);
   system.set_sensor(SensorId::SmuApps2Raw, 2750U);
   Frame recovered{};
   const bool recovered_received = wait_for_matching_frame(
       system, raceup::sil::can_id::SmuSense,
-      [](const Frame& candidate) {
-        return candidate.dlc == 3U && candidate.data[0] == 75U &&
-               candidate.data[1] == 50U && candidate.data[2] == 0U;
-      },
+      [](const Frame& f) { return is_smu_sense_frame(f, 75U, 50U, 0U); },
       recovered);
   context.expect(recovered_received,
                  "SMU clears the plausibility fault and follows restored pedals");
   if (recovered_received) {
-    context.expect(system.output(OutputId::SmuThrottlePercent) == 75U,
-                   "SMU throttle output recovers to 75 percent");
+    expect_smu_outputs(context, system, 75U, 50U);
+  }
+
+  system.stop();
+}
+
+void test_smu_threshold_boundaries_and_pedal_clamping(TestContext& context) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+  const bool started = system.start();
+  context.expect(started, "SIL starts for SMU boundary thresholds and clamping test");
+  if (!started) {
+    return;
+  }
+
+  // 1. Raw track difference boundary:
+  // kAppsShortThresholdRaw is 50 counts.
+  // APP1 raw = 3500 (50%).
+  // APP2 raw = 3451 -> |3500 - 3451| = 49 counts (< 50) -> Fault 1 (Short), throttle 0%.
+  system.set_sensor(SensorId::SmuApps1Raw, 3500U);
+  system.set_sensor(SensorId::SmuApps2Raw, 3451U);
+  system.set_sensor(SensorId::SmuBrakeRaw, 2500U);
+  Frame f_short{};
+  const bool short_received = wait_for_matching_frame(
+      system, raceup::sil::can_id::SmuSense,
+      [](const Frame& f) { return is_smu_sense_frame(f, 0U, 50U, 1U); },
+      f_short);
+  context.expect(short_received,
+                 "Raw difference of 49 counts (< 50) triggers Fault 1 (track short)");
+
+  // APP2 raw = 3450 -> |3500 - 3450| = 50 counts (not < 50; short check passes).
+  // APP2 normalized = (3500 - 3450)*100 / 1000 = 5%.
+  // Difference in percent = |50 - 5| = 45% (> 10%) -> triggers Fault 2 (Implausible), NOT Fault 1!
+  system.set_sensor(SensorId::SmuApps2Raw, 3450U);
+  Frame f_implaus{};
+  const bool implaus_received = wait_for_matching_frame(
+      system, raceup::sil::can_id::SmuSense,
+      [](const Frame& f) { return is_smu_sense_frame(f, 0U, 50U, 2U); },
+      f_implaus);
+  context.expect(implaus_received,
+                 "Raw difference of 50 counts does NOT trigger track short; proceeds to Fault 2");
+
+  // 2. Plausibility percentage boundary:
+  // kAppsPlausibilityThresholdPercent is 10%.
+  // APP1 raw = 3500 (50%).
+  // APP2 raw = 3100 -> normalized = (3500 - 3100) * 100 / 1000 = 40%.
+  // Raw difference = |3500 - 3100| = 400 (>= 50).
+  // Percent difference = |50 - 40| = 10% (not > 10%) -> Nominal (Fault 0), throttle 50%.
+  system.set_sensor(SensorId::SmuApps2Raw, 3100U);
+  Frame f_plaus_nominal{};
+  const bool plaus_nominal_received = wait_for_matching_frame(
+      system, raceup::sil::can_id::SmuSense,
+      [](const Frame& f) { return is_smu_sense_frame(f, 50U, 50U, 0U); },
+      f_plaus_nominal);
+  context.expect(plaus_nominal_received,
+                 "Pedal percentage difference of exactly 10% is accepted as nominal (Fault 0)");
+
+  // APP2 raw = 3110 -> normalized = (3500 - 3110) * 100 / 1000 = 39%.
+  // Percent difference = |50 - 39| = 11% (> 10%) -> Fault 2 (Implausible), throttle 0%.
+  system.set_sensor(SensorId::SmuApps2Raw, 3110U);
+  Frame f_plaus_fault{};
+  const bool plaus_fault_received = wait_for_matching_frame(
+      system, raceup::sil::can_id::SmuSense,
+      [](const Frame& f) { return is_smu_sense_frame(f, 0U, 50U, 2U); },
+      f_plaus_fault);
+  context.expect(plaus_fault_received,
+                 "Pedal percentage difference of 11% (> 10%) triggers Fault 2 (implausibility)");
+
+  // 3. Asymmetric pedal outputs: throttle must follow APP1, not APP2:
+  // APP1 raw = 3500 (50%), APP2 raw = 3050 (45%).
+  // Percent difference = 5% <= 10% -> Fault 0.
+  // Throttle must be 50% (APP1), not 45% (APP2).
+  system.set_sensor(SensorId::SmuApps2Raw, 3050U);
+  Frame f_asym{};
+  const bool asym_received = wait_for_matching_frame(
+      system, raceup::sil::can_id::SmuSense,
+      [](const Frame& f) { return is_smu_sense_frame(f, 50U, 50U, 0U); },
+      f_asym);
+  context.expect(asym_received,
+                 "Nominal throttle output follows APP1 (50%) when pedals differ within 10%");
+  if (asym_received) {
+    expect_smu_outputs(context, system, 50U, 50U);
+  }
+
+  // 4. Clamping beyond full and zero:
+  // Brake sensor raw = 500 (full threshold is 1000) -> must clamp to 100%.
+  system.set_sensor(SensorId::SmuApps1Raw, 3500U);
+  system.set_sensor(SensorId::SmuApps2Raw, 3000U);
+  system.set_sensor(SensorId::SmuBrakeRaw, 500U);
+  Frame f_clamp_full{};
+  const bool clamp_full_received = wait_for_matching_frame(
+      system, raceup::sil::can_id::SmuSense,
+      [](const Frame& f) { return is_smu_sense_frame(f, 50U, 100U, 0U); },
+      f_clamp_full);
+  context.expect(clamp_full_received,
+                 "Brake raw below full threshold (500 < 1000) clamps to 100%");
+  if (clamp_full_received) {
+    context.expect(system.output(OutputId::SmuBrakePercent) == 100U,
+                   "Brake output clamped to 100%");
+  }
+
+  // Brake sensor raw = 4100 (zero threshold is 4000) -> must clamp to 0%.
+  system.set_sensor(SensorId::SmuBrakeRaw, 4100U);
+  Frame f_clamp_zero{};
+  const bool clamp_zero_received = wait_for_matching_frame(
+      system, raceup::sil::can_id::SmuSense,
+      [](const Frame& f) { return is_smu_sense_frame(f, 50U, 0U, 0U); },
+      f_clamp_zero);
+  context.expect(clamp_zero_received,
+                 "Brake raw above zero threshold (4100 > 4000) clamps to 0%");
+  if (clamp_zero_received) {
+    context.expect(system.output(OutputId::SmuBrakePercent) == 0U,
+                   "Brake output clamped to 0%");
   }
 
   system.stop();
@@ -343,43 +545,28 @@ void test_ebs_nominal_and_stale_input(TestContext& context) {
 
   // 1. Establish and verify exact nominal state
   Frame nominal{};
-  const bool nominal_received = wait_for_ebs_status_with_inputs(
-      system, {},
-      [](const Frame& f) {
-        return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
-               f.data[2] == 0U && f.data[3] == 0U && f.data[4] == 0U;
-      },
-      nominal);
+  const bool nominal_received = wait_for_ebs_nominal(system, nominal);
   context.expect(nominal_received,
                  "EBS reaches nominal state with fresh inputs");
   if (nominal_received) {
-    context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                   "EBS closes ASNode in nominal state");
-    context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
-                   "EBS valve 1 is disengaged in nominal state");
-    context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
-                   "EBS valve 2 is disengaged in nominal state");
-    context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                   "EBS fault code is 0 in nominal state");
+    expect_ebs_nominal_outputs(context, system);
   } else {
     system.stop();
     return;
   }
 
   // 2. Stop refreshing inputs: after 25 cycles (250 ms), inputs become stale.
-  // Use an explicit 800 ms deadline instead of wait_for_matching_frame (which uses the global
-  // kWait = 300 ms constant) because the stale threshold itself is ~250 ms and 300 ms can be
-  // insufficient under system load. 800 ms provides reliable margin without hanging.
+  // A deadline of 380 ms guarantees staleness is detected promptly without hanging,
+  // while strictly catching mutations that inflate the timeout beyond the 25-cycle specification (e.g. 60 cycles = 600 ms).
   Frame stale_frame{};
   bool stale_received = false;
   {
-    const auto stale_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(800);
+    const auto stale_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(380);
     while (std::chrono::steady_clock::now() < stale_deadline) {
       Frame f{};
       if (system.receive_frame(f, std::chrono::milliseconds(20)) &&
           f.id == raceup::sil::can_id::EbsStatus &&
-          f.dlc == 5U && f.data[0] == 0U && f.data[1] == 1U &&
-          f.data[2] == 1U && f.data[3] == 1U) {
+          is_ebs_safe_frame(f, 1U)) {
         stale_frame = f;
         stale_received = true;
         break;
@@ -388,16 +575,9 @@ void test_ebs_nominal_and_stale_input(TestContext& context) {
   }
   context.expect(
       stale_received,
-      "EBS enters safe state with communication fault 1 when inputs become stale");
+      "EBS enters safe state with communication fault 1 when inputs become stale within 380 ms");
   if (stale_received) {
-    context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
-                   "EBS opens ASNode after inputs become stale");
-    context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
-                   "EBS engages valve 1 on stale input fault");
-    context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
-                   "EBS engages valve 2 on stale input fault");
-    context.expect(system.output(OutputId::EbsFaultCode) == 1U,
-                   "EBS output fault code is 1 (communication)");
+    expect_ebs_safe_outputs(context, system, 1U);
   }
 
   system.stop();
@@ -421,27 +601,14 @@ void test_ebs_requires_ready_to_drive(TestContext& context) {
   nominal_inputs.ready_to_drive = true;
 
   Frame nominal_frame{};
-  const bool nominal_received = wait_for_ebs_status_with_inputs(
-      system, nominal_inputs,
-      [](const Frame& f) {
-        return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
-               f.data[2] == 0U && f.data[3] == 0U && f.data[4] == 0U;
-      },
-      nominal_frame);
+  const bool nominal_received = wait_for_ebs_nominal(system, nominal_frame, nominal_inputs);
   context.expect(nominal_received,
                  "EBS reaches nominal state with manual = true, ready_to_drive = true");
   if (!nominal_received) {
     system.stop();
     return;
   }
-  context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                 "ASNode closed in initial nominal state");
-  context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
-                 "Valve 1 disengaged in initial nominal state");
-  context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
-                 "Valve 2 disengaged in initial nominal state");
-  context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                 "Fault code 0 in initial nominal state");
+  expect_ebs_nominal_outputs(context, system, "initial nominal");
 
   // Phase 2: keep manual = true, change ready_to_drive to false -> safe state with fault 1
   EbsInputs not_ready_inputs{};
@@ -449,25 +616,12 @@ void test_ebs_requires_ready_to_drive(TestContext& context) {
   not_ready_inputs.ready_to_drive = false;
 
   Frame not_ready_frame{};
-  const bool not_ready_received = wait_for_ebs_status_with_inputs(
-      system, not_ready_inputs,
-      [](const Frame& f) {
-        return f.dlc == 5U && f.data[0] == 0U && f.data[1] == 1U &&
-               f.data[2] == 1U && f.data[3] == 1U;
-      },
-      not_ready_frame);
+  const bool not_ready_received = wait_for_ebs_safe(system, 1U, not_ready_frame, not_ready_inputs);
   context.expect(
       not_ready_received,
       "EBS enters safe state with fault 1 when ready-to-drive becomes inactive (manual remains true)");
   if (not_ready_received) {
-    context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
-                   "ASNode opens when ready-to-drive is false");
-    context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
-                   "Valve 1 engages when ready-to-drive is false");
-    context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
-                   "Valve 2 engages when ready-to-drive is false");
-    context.expect(system.output(OutputId::EbsFaultCode) == 1U,
-                   "Fault code is 1 (communication) when ready-to-drive is false");
+    expect_ebs_safe_outputs(context, system, 1U, "ready-to-drive false");
   } else {
     system.stop();
     return;
@@ -479,24 +633,11 @@ void test_ebs_requires_ready_to_drive(TestContext& context) {
   ready_inputs.ready_to_drive = true;
 
   Frame recovered_frame{};
-  const bool recovered_received = wait_for_ebs_status_with_inputs(
-      system, ready_inputs,
-      [](const Frame& f) {
-        return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
-               f.data[2] == 0U && f.data[3] == 0U && f.data[4] == 0U;
-      },
-      recovered_frame);
+  const bool recovered_received = wait_for_ebs_nominal(system, recovered_frame, ready_inputs);
   context.expect(recovered_received,
                  "EBS returns to nominal state after ready-to-drive is restored");
   if (recovered_received) {
-    context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                   "ASNode closes after readiness restored");
-    context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
-                   "Valve 1 disengages after readiness restored");
-    context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
-                   "Valve 2 disengages after readiness restored");
-    context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                   "Fault code is cleared after readiness restored");
+    expect_ebs_nominal_outputs(context, system, "readiness restored");
   }
 
   system.stop();
@@ -513,41 +654,24 @@ void test_ebs_brake_request_and_mission_finished(TestContext& context) {
 
   // 1. Establish nominal baseline
   Frame nominal{};
-  const bool nominal_received = wait_for_ebs_status_with_inputs(
-      system, {},
-      [](const Frame& f) {
-        return f.dlc == 5U && f.data[0] == 1U && f.data[3] == 0U;
-      },
-      nominal);
+  const bool nominal_received = wait_for_ebs_nominal(system, nominal);
   context.expect(nominal_received, "EBS reaches nominal baseline before command changes");
   if (!nominal_received) {
     system.stop();
     return;
   }
+  expect_ebs_nominal_outputs(context, system, "baseline");
 
   // 2. Live brake request -> safe state with fault 6 (BrakeRequest)
   EbsInputs brake_req_inputs{};
   brake_req_inputs.brake_request = true;
 
   Frame brake_req_frame{};
-  const bool brake_req_received = wait_for_ebs_status_with_inputs(
-      system, brake_req_inputs,
-      [](const Frame& f) {
-        return f.dlc == 5U && f.data[0] == 0U && f.data[1] == 1U &&
-               f.data[2] == 1U && f.data[3] == 6U;
-      },
-      brake_req_frame);
+  const bool brake_req_received = wait_for_ebs_safe(system, 6U, brake_req_frame, brake_req_inputs);
   context.expect(brake_req_received,
                  "EBS opens ASNode and engages valves on live brake request (fault 6)");
   if (brake_req_received) {
-    context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
-                   "ASNode open on brake request");
-    context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
-                   "Valve 1 engaged on brake request");
-    context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
-                   "Valve 2 engaged on brake request");
-    context.expect(system.output(OutputId::EbsFaultCode) == 6U,
-                   "Fault code is 6 (brake request)");
+    expect_ebs_safe_outputs(context, system, 6U, "brake request");
   } else {
     system.stop();
     return;
@@ -555,13 +679,7 @@ void test_ebs_brake_request_and_mission_finished(TestContext& context) {
 
   // 3. Recovery from brake request -> nominal (complete predicate, guard for mission-finished phase)
   Frame recovered_brake{};
-  const bool rec_brake_received = wait_for_ebs_status_with_inputs(
-      system, {},
-      [](const Frame& f) {
-        return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
-               f.data[2] == 0U && f.data[3] == 0U && f.data[4] == 0U;
-      },
-      recovered_brake);
+  const bool rec_brake_received = wait_for_ebs_nominal(system, recovered_brake);
   context.expect(rec_brake_received,
                  "EBS returns to complete nominal state after brake request is cleared");
   if (!rec_brake_received) {
@@ -569,38 +687,18 @@ void test_ebs_brake_request_and_mission_finished(TestContext& context) {
     system.stop();
     return;
   }
-  context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                 "ASNode closed after brake-request recovery");
-  context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
-                 "Valve 1 disengaged after brake-request recovery");
-  context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
-                 "Valve 2 disengaged after brake-request recovery");
-  context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                 "Fault code is 0 after brake-request recovery");
+  expect_ebs_nominal_outputs(context, system, "brake-request recovery");
 
   // 4. Live mission finished -> safe state with fault 6 (BrakeRequest)
   EbsInputs finish_inputs{};
   finish_inputs.mission_finished = true;
 
   Frame finish_frame{};
-  const bool finish_received = wait_for_ebs_status_with_inputs(
-      system, finish_inputs,
-      [](const Frame& f) {
-        return f.dlc == 5U && f.data[0] == 0U && f.data[1] == 1U &&
-               f.data[2] == 1U && f.data[3] == 6U;
-      },
-      finish_frame);
+  const bool finish_received = wait_for_ebs_safe(system, 6U, finish_frame, finish_inputs);
   context.expect(finish_received,
                  "EBS opens ASNode and engages valves on mission finished (fault 6)");
   if (finish_received) {
-    context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
-                   "ASNode open on mission finished");
-    context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
-                   "Valve 1 engaged on mission finished");
-    context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
-                   "Valve 2 engaged on mission finished");
-    context.expect(system.output(OutputId::EbsFaultCode) == 6U,
-                   "Fault code is 6 (mission finished)");
+    expect_ebs_safe_outputs(context, system, 6U, "mission finished");
   } else {
     system.stop();
     return;
@@ -608,24 +706,11 @@ void test_ebs_brake_request_and_mission_finished(TestContext& context) {
 
   // 5. Recovery from mission finished -> complete nominal state
   Frame recovered_finish{};
-  const bool rec_finish_received = wait_for_ebs_status_with_inputs(
-      system, {},
-      [](const Frame& f) {
-        return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
-               f.data[2] == 0U && f.data[3] == 0U && f.data[4] == 0U;
-      },
-      recovered_finish);
+  const bool rec_finish_received = wait_for_ebs_nominal(system, recovered_finish);
   context.expect(rec_finish_received,
                  "EBS returns to complete nominal state after mission finished is cleared");
   if (rec_finish_received) {
-    context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                   "ASNode closed after mission-finished recovery");
-    context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
-                   "Valve 1 disengaged after mission-finished recovery");
-    context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
-                   "Valve 2 disengaged after mission-finished recovery");
-    context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                   "Fault code is 0 after mission-finished recovery");
+    expect_ebs_nominal_outputs(context, system, "mission-finished recovery");
   }
 
   system.stop();
@@ -708,15 +793,7 @@ void test_ebs_missing_critical_inputs(TestContext& context) {
         test_case.name);
 
     if (any_safe_seen) {
-      context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
-                     "[{}]: ASNode is open at end of observation", test_case.name);
-      context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
-                     "[{}]: Valve 1 is engaged at end of observation", test_case.name);
-      context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
-                     "[{}]: Valve 2 is engaged at end of observation", test_case.name);
-      context.expect(system.output(OutputId::EbsFaultCode) == 1U,
-                     "[{}]: Fault code is 1 (communication) at end of observation",
-                     test_case.name);
+      expect_ebs_safe_outputs(context, system, 1U, test_case.name);
     }
 
     system.stop();
@@ -748,18 +825,14 @@ void test_ebs_individual_input_staleness(TestContext& context) {
 
     // 1. Establish nominal baseline with all 3 streams active
     Frame nominal{};
-    const bool nominal_received = wait_for_ebs_status_with_inputs(
-        system, {},
-        [](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 1U && f.data[3] == 0U;
-        },
-        nominal);
+    const bool nominal_received = wait_for_ebs_nominal(system, nominal);
     context.expect(nominal_received,
                    "[{} - nominal] EBS reaches nominal baseline", test_case.name);
     if (!nominal_received) {
       system.stop();
       continue;
     }
+    expect_ebs_nominal_outputs(context, system, test_case.name);
 
     // 2. Stop one stream while refreshing the other two -> safe state with fault 1
     Frame stale_frame{};
@@ -777,24 +850,16 @@ void test_ebs_individual_input_staleness(TestContext& context) {
           }
         },
         [](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 0U && f.data[1] == 1U &&
-                 f.data[2] == 1U && f.data[3] == 1U;
+          return is_ebs_safe_frame(f, 1U);
         },
-        stale_frame, std::chrono::milliseconds(800));
+        stale_frame, std::chrono::milliseconds(400));
 
     context.expect(
         stale_received,
         "[{} - stale]: EBS returns to safe state with fault 1 when stream stops",
         test_case.name);
     if (stale_received) {
-      context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
-                     "[{} - stale]: ASNode opens", test_case.name);
-      context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
-                     "[{} - stale]: Valve 1 engages", test_case.name);
-      context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
-                     "[{} - stale]: Valve 2 engages", test_case.name);
-      context.expect(system.output(OutputId::EbsFaultCode) == 1U,
-                     "[{} - stale]: Fault code is 1", test_case.name);
+      expect_ebs_safe_outputs(context, system, 1U, test_case.name);
     } else {
       system.stop();
       continue;
@@ -802,25 +867,13 @@ void test_ebs_individual_input_staleness(TestContext& context) {
 
     // 3. Resume sending all 3 streams -> recovery to nominal
     Frame recovered{};
-    const bool recovered_received = wait_for_ebs_status_with_inputs(
-        system, {},
-        [](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 1U && f.data[3] == 0U;
-        },
-        recovered);
+    const bool recovered_received = wait_for_ebs_nominal(system, recovered);
     context.expect(
         recovered_received,
         "[{} - recovery]: EBS recovers to nominal after stream is restored",
         test_case.name);
     if (recovered_received) {
-      context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                     "[{} - recovery]: ASNode closes", test_case.name);
-      context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
-                     "[{} - recovery]: Valve 1 disengages", test_case.name);
-      context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
-                     "[{} - recovery]: Valve 2 disengages", test_case.name);
-      context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                     "[{} - recovery]: Fault code is 0", test_case.name);
+      expect_ebs_nominal_outputs(context, system, test_case.name);
     }
 
     system.stop();
@@ -852,94 +905,42 @@ void test_ebs_invalid_pneumatic_pressure(TestContext& context) {
 
     // Phase 1: Nominal inputs (8U, 8U) -> verify nominal
     Frame nominal{};
-    const bool nominal_received = wait_for_ebs_status_with_refresh(
-        system, 8U, 8U,
-        [](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
-                 f.data[2] == 0U && f.data[3] == 0U && f.data[4] == 0U;
-        },
-        nominal);
+    const bool nominal_received = wait_for_ebs_nominal(system, nominal);
     context.expect(nominal_received,
                   "[{} - nominal] EBS publishes nominal status frame",
                   test_case.name);
-    if (nominal_received) {
-      context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                    "[{} - nominal] EBS closes ASNode in nominal state",
-                    test_case.name);
-      context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
-                    "[{} - nominal] EBS valve 1 is disengaged in nominal state",
-                    test_case.name);
-      context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
-                    "[{} - nominal] EBS valve 2 is disengaged in nominal state",
-                    test_case.name);
-      context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                    "[{} - nominal] EBS reports no fault in nominal state",
-                    test_case.name);
-    } else {
+    if (!nominal_received) {
       system.stop();
       continue;
     }
+    expect_ebs_nominal_outputs(context, system, test_case.name);
 
     // Phase 2: Fault pressure (test_case.left, test_case.right) -> verify safe state with fault 3
+    EbsInputs fault_inputs{};
+    fault_inputs.pneumatic_left = test_case.left;
+    fault_inputs.pneumatic_right = test_case.right;
+
     Frame fault{};
-    const bool fault_received = wait_for_ebs_status_with_refresh(
-        system, test_case.left, test_case.right,
-        [](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 0U && f.data[1] == 1U &&
-                 f.data[2] == 1U && f.data[3] == 3U && f.data[4] == 0U;
-        },
-        fault);
+    const bool fault_received = wait_for_ebs_safe(system, 3U, fault, fault_inputs);
     context.expect(
         fault_received,
         "[{} - fault] EBS status reports fault code 3 and enters safe state",
         test_case.name);
-    if (fault_received) {
-      context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
-                    "[{} - fault] EBS opens ASNode on pneumatic fault",
-                    test_case.name);
-      context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
-                    "[{} - fault] EBS engages valve 1 on pneumatic fault",
-                    test_case.name);
-      context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
-                    "[{} - fault] EBS engages valve 2 on pneumatic fault",
-                    test_case.name);
-      context.expect(
-          system.output(OutputId::EbsFaultCode) == 3U,
-          "[{} - fault] EBS output fault code is 3 (pneumatic pressure)",
-          test_case.name);
-    } else {
+    if (!fault_received) {
       system.stop();
       continue;
     }
+    expect_ebs_safe_outputs(context, system, 3U, test_case.name);
 
     // Phase 3: Recovered pressures (8U, 8U) -> verify return to nominal
     Frame recovered{};
-    const bool recovered_received = wait_for_ebs_status_with_refresh(
-        system, 8U, 8U,
-        [](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
-                 f.data[2] == 0U && f.data[3] == 0U && f.data[4] == 0U;
-        },
-        recovered);
+    const bool recovered_received = wait_for_ebs_nominal(system, recovered);
     context.expect(
         recovered_received,
         "[{} - recovery] EBS status returns to nominal after pressure recovery",
         test_case.name);
     if (recovered_received) {
-      context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                    "[{} - recovery] EBS closes ASNode after recovery",
-                    test_case.name);
-      context.expect(
-          system.output(OutputId::EbsValve1Engaged) == 0U,
-          "[{} - recovery] EBS valve 1 is disengaged after recovery",
-          test_case.name);
-      context.expect(
-          system.output(OutputId::EbsValve2Engaged) == 0U,
-          "[{} - recovery] EBS valve 2 is disengaged after recovery",
-          test_case.name);
-      context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                    "[{} - recovery] EBS reports no fault after recovery",
-                    test_case.name);
+      expect_ebs_nominal_outputs(context, system, test_case.name);
     }
 
     system.stop();
@@ -975,18 +976,14 @@ void test_ebs_hydraulic_pressure_and_coherency(TestContext& context) {
 
     // Phase 1: Establish nominal baseline (front 40, rear 40, pneu 8, 8)
     Frame nominal{};
-    const bool nominal_received = wait_for_ebs_status_with_inputs(
-        system, {},
-        [](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 1U && f.data[3] == 0U;
-        },
-        nominal);
+    const bool nominal_received = wait_for_ebs_nominal(system, nominal);
     context.expect(nominal_received, "[{} - nominal] EBS reaches nominal state",
                    test_case.name);
     if (!nominal_received) {
       system.stop();
       continue;
     }
+    expect_ebs_nominal_outputs(context, system, test_case.name);
 
     // Phase 2: Inject fault pressures -> safe state with fault code 4 (BrakePressure)
     EbsInputs fault_inputs{};
@@ -996,51 +993,25 @@ void test_ebs_hydraulic_pressure_and_coherency(TestContext& context) {
     fault_inputs.pneumatic_right = test_case.right_pneu;
 
     Frame fault{};
-    const bool fault_received = wait_for_ebs_status_with_inputs(
-        system, fault_inputs,
-        [](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 0U && f.data[1] == 1U &&
-                 f.data[2] == 1U && f.data[3] == 4U && f.data[4] == 0U;
-        },
-        fault);
+    const bool fault_received = wait_for_ebs_safe(system, 4U, fault, fault_inputs);
     context.expect(
         fault_received,
         "[{} - fault] EBS enters safe state with fault code 4 (brake pressure)",
         test_case.name);
-    if (fault_received) {
-      context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
-                     "[{} - fault] ASNode opens", test_case.name);
-      context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
-                     "[{} - fault] Valve 1 engages", test_case.name);
-      context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
-                     "[{} - fault] Valve 2 engages", test_case.name);
-      context.expect(system.output(OutputId::EbsFaultCode) == 4U,
-                     "[{} - fault] Fault code is 4 (BrakePressure)", test_case.name);
-    } else {
+    if (!fault_received) {
       system.stop();
       continue;
     }
+    expect_ebs_safe_outputs(context, system, 4U, test_case.name);
 
     // Phase 3: Recovery back to nominal inputs
     Frame recovered{};
-    const bool recovered_received = wait_for_ebs_status_with_inputs(
-        system, {},
-        [](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 1U && f.data[3] == 0U;
-        },
-        recovered);
+    const bool recovered_received = wait_for_ebs_nominal(system, recovered);
     context.expect(
         recovered_received,
         "[{} - recovery] EBS recovers to nominal state", test_case.name);
     if (recovered_received) {
-      context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                     "[{} - recovery] ASNode closes", test_case.name);
-      context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
-                     "[{} - recovery] Valve 1 disengages", test_case.name);
-      context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
-                     "[{} - recovery] Valve 2 disengages", test_case.name);
-      context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                     "[{} - recovery] Fault code is cleared", test_case.name);
+      expect_ebs_nominal_outputs(context, system, test_case.name);
     }
 
     system.stop();
@@ -1058,12 +1029,7 @@ void test_ebs_nominal_maintained_with_refresh(TestContext& context) {
 
   // 1. Establish nominal baseline before verifying sustained nominal state
   Frame nominal{};
-  const bool nominal_reached = wait_for_ebs_status_with_inputs(
-      system, {},
-      [](const Frame& f) {
-        return f.dlc == 5U && f.data[0] == 1U && f.data[3] == 0U;
-      },
-      nominal);
+  const bool nominal_reached = wait_for_ebs_nominal(system, nominal);
   context.expect(nominal_reached, "EBS reaches initial nominal state");
   if (!nominal_reached) {
     system.stop();
@@ -1092,8 +1058,7 @@ void test_ebs_nominal_maintained_with_refresh(TestContext& context) {
     if (system.receive_frame(frame, kPollTimeout) &&
         frame.id == raceup::sil::can_id::EbsStatus) {
       ++status_count;
-      if (frame.data[0] != 1U || frame.data[1] != 0U || frame.data[2] != 0U ||
-          frame.data[3] != 0U) {
+      if (!is_ebs_nominal_frame(frame)) {
         any_fault_seen = true;
       }
     }
@@ -1104,13 +1069,7 @@ void test_ebs_nominal_maintained_with_refresh(TestContext& context) {
                  status_count);
   context.expect(!any_fault_seen,
                  "EBS maintained continuous nominal state without any fault drop");
-  context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                 "ASNode remains closed after 400ms sustained refresh");
-  context.expect(system.output(OutputId::EbsValve1Engaged) == 0U &&
-                     system.output(OutputId::EbsValve2Engaged) == 0U,
-                 "Both valves remain disengaged after 400ms sustained refresh");
-  context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                 "Fault code remains 0 after 400ms sustained refresh");
+  expect_ebs_nominal_outputs(context, system, "sustained refresh");
 
   system.stop();
 }
@@ -1139,72 +1098,183 @@ void test_ebs_sensor_faults(TestContext& context) {
 
     // 1. Establish nominal state
     Frame nominal{};
-    const bool nominal_received = wait_for_ebs_status_with_refresh(
-        system, 8U, 8U,
-        [](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
-                 f.data[2] == 0U && f.data[3] == 0U && f.data[4] == 0U;
-        },
-        nominal);
+    const bool nominal_received = wait_for_ebs_nominal(system, nominal);
     context.expect(nominal_received,
                    "[{} - nominal] EBS reaches nominal state", test_case.name);
     if (!nominal_received) {
       system.stop();
       continue;
     }
+    expect_ebs_nominal_outputs(context, system, test_case.name);
 
     // 2. Trigger sensor fault by deactivating the sensor
     system.set_sensor(test_case.sensor, 0U);
     Frame fault{};
-    const bool fault_received = wait_for_ebs_status_with_refresh(
-        system, 8U, 8U,
-        [expected_fault = test_case.expected_fault](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 0U && f.data[1] == 1U &&
-                 f.data[2] == 1U && f.data[3] == expected_fault && f.data[4] == 0U;
-        },
-        fault);
+    const bool fault_received = wait_for_ebs_safe(system, test_case.expected_fault, fault);
     context.expect(fault_received,
                    "[{} - fault] EBS enters safe state with fault code {}",
                    test_case.name, test_case.expected_fault);
-    if (fault_received) {
-      context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
-                     "[{} - fault] ASNode opens on sensor fault", test_case.name);
-      context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
-                     "[{} - fault] Valve 1 engages on sensor fault", test_case.name);
-      context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
-                     "[{} - fault] Valve 2 engages on sensor fault", test_case.name);
-      context.expect(system.output(OutputId::EbsFaultCode) == test_case.expected_fault,
-                     "[{} - fault] Fault code matches expected", test_case.name);
-    } else {
+    if (!fault_received) {
       system.stop();
       continue;
     }
+    expect_ebs_safe_outputs(context, system, test_case.expected_fault, test_case.name);
 
     // 3. Restore sensor to 1 and verify recovery to nominal
     system.set_sensor(test_case.sensor, 1U);
     Frame recovered{};
-    const bool recovered_received = wait_for_ebs_status_with_refresh(
-        system, 8U, 8U,
-        [](const Frame& f) {
-          return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
-                 f.data[2] == 0U && f.data[3] == 0U && f.data[4] == 0U;
-        },
-        recovered);
+    const bool recovered_received = wait_for_ebs_nominal(system, recovered);
     context.expect(recovered_received,
                    "[{} - recovery] EBS recovers to nominal state", test_case.name);
     if (recovered_received) {
-      context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                     "[{} - recovery] ASNode closes after recovery", test_case.name);
-      context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
-                     "[{} - recovery] Valve 1 disengages after recovery", test_case.name);
-      context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
-                     "[{} - recovery] Valve 2 disengages after recovery", test_case.name);
-      context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                     "[{} - recovery] Fault code is cleared after recovery", test_case.name);
+      expect_ebs_nominal_outputs(context, system, test_case.name);
     }
 
     system.stop();
   }
+}
+
+void test_ebs_speed_limit_and_recovery(TestContext& context) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+  const bool started = system.start();
+  context.expect(started, "SIL starts for EBS speed stationary boundary test");
+  if (!started) {
+    return;
+  }
+
+  // Phase 1: Stationary boundary speed == 5 decimeters/s -> nominal (ASNode closed, valves disengaged)
+  EbsInputs stationary_inputs{};
+  stationary_inputs.speed = 5U;
+  Frame stationary_frame{};
+  const bool stationary_received = wait_for_ebs_status_with_inputs(
+      system, stationary_inputs,
+      [](const Frame& f) {
+        return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
+               f.data[2] == 0U && f.data[3] == 0U && f.data[4] == 5U;
+      },
+      stationary_frame);
+  context.expect(stationary_received,
+                 "EBS closes ASNode at stationary boundary speed = 5 dm/s (frame data[4] == 5)");
+  if (stationary_received) {
+    context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
+                   "ASNode closed at speed = 5 dm/s");
+    context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
+                   "Valve 1 disengaged at speed = 5 dm/s");
+    context.expect(system.output(OutputId::EbsValve2Engaged) == 0U,
+                   "Valve 2 disengaged at speed = 5 dm/s");
+    context.expect(system.output(OutputId::EbsFaultCode) == 0U,
+                   "Fault code is 0 at speed = 5 dm/s");
+  } else {
+    system.stop();
+    return;
+  }
+
+  // Phase 2: Moving vehicle speed == 6 decimeters/s (> 5 dm/s threshold)
+  // Per requirements, ASNode must open and brakes engage, while fault code remains 0 (no fault active).
+  EbsInputs moving_inputs{};
+  moving_inputs.speed = 6U;
+  Frame moving_frame{};
+  const bool moving_received = wait_for_ebs_status_with_inputs(
+      system, moving_inputs,
+      [](const Frame& f) {
+        return f.dlc == 5U && f.data[0] == 0U && f.data[1] == 1U &&
+               f.data[2] == 1U && f.data[3] == 0U && f.data[4] == 6U;
+      },
+      moving_frame);
+  context.expect(
+      moving_received,
+      "EBS opens ASNode and engages brakes when moving at speed = 6 dm/s with fault code 0");
+  if (moving_received) {
+    context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
+                   "ASNode open when vehicle is moving (speed = 6 dm/s)");
+    context.expect(system.output(OutputId::EbsValve1Engaged) == 1U,
+                   "Valve 1 engaged when moving (speed = 6 dm/s)");
+    context.expect(system.output(OutputId::EbsValve2Engaged) == 1U,
+                   "Valve 2 engaged when moving (speed = 6 dm/s)");
+    context.expect(system.output(OutputId::EbsFaultCode) == 0U,
+                   "Fault code remains 0 when moving (non-fault brake engagement)");
+  } else {
+    system.stop();
+    return;
+  }
+
+  // Phase 3: Recovery when vehicle returns to stationary speed == 5 dm/s
+  Frame recovered_frame{};
+  const bool recovered_received = wait_for_ebs_status_with_inputs(
+      system, stationary_inputs,
+      [](const Frame& f) {
+        return f.dlc == 5U && f.data[0] == 1U && f.data[1] == 0U &&
+               f.data[2] == 0U && f.data[3] == 0U && f.data[4] == 5U;
+      },
+      recovered_frame);
+  context.expect(recovered_received,
+                 "EBS restores closed ASNode when speed returns to 5 dm/s");
+  if (recovered_received) {
+    context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
+                   "ASNode closed after returning to speed = 5 dm/s");
+    context.expect(system.output(OutputId::EbsValve1Engaged) == 0U,
+                   "Valve 1 disengaged after returning to speed = 5 dm/s");
+  }
+
+  system.stop();
+}
+
+void test_ebs_short_dlc_frame_rejected(TestContext& context) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+  const bool started = system.start();
+  context.expect(started, "SIL starts for EBS short DLC rejection test");
+  if (!started) {
+    return;
+  }
+
+  // Phase 1: Establish nominal state
+  Frame nominal{};
+  const bool nominal_received = wait_for_ebs_nominal(system, nominal);
+  context.expect(nominal_received, "EBS establishes nominal state with valid DLC frames");
+  if (!nominal_received) {
+    system.stop();
+    return;
+  }
+
+  // Phase 2: Send VehicleStatus with DLC = 2 (less than required 3 bytes).
+  // BrakePressure and EbsCommand continue to be refreshed with valid DLC.
+  // Because VehicleStatus DLC is insufficient, EBS must reject it, vehicle_age will reach 25 cycles,
+  // and EBS must drop into safe state with communication fault 1.
+  Frame safe_frame{};
+  const bool safe_received = wait_for_ebs_status_with_publisher(
+      system,
+      [&system] {
+        Frame short_vs = raceup::sil::make_frame(raceup::sil::can_id::VehicleStatus, 2U);
+        short_vs.data[0] = 0U;
+        short_vs.data[1] = 1U;
+        system.send_frame(short_vs);
+        system.send_frame(brake_pressure(40U, 40U, 8U, 8U));
+        system.send_frame(ebs_command(false, false));
+      },
+      [](const Frame& f) { return is_ebs_safe_frame(f, 1U); },
+      safe_frame);
+  context.expect(
+      safe_received,
+      "EBS rejects VehicleStatus with DLC = 2 and enters safe state (fault 1) on staleness");
+  if (safe_received) {
+    expect_ebs_safe_outputs(context, system, 1U, "short DLC frame");
+  } else {
+    system.stop();
+    return;
+  }
+
+  // Phase 3: Restore valid DLC = 3 VehicleStatus -> recovery to nominal
+  Frame recovered{};
+  const bool recovered_received = wait_for_ebs_nominal(system, recovered);
+  context.expect(recovered_received,
+                 "EBS recovers to nominal when valid DLC = 3 frames are restored");
+  if (recovered_received) {
+    expect_ebs_nominal_outputs(context, system, "recovered valid DLC");
+  }
+
+  system.stop();
 }
 
 void test_receive_frame_timeout(TestContext& context) {
@@ -1227,15 +1297,8 @@ void test_receive_frame_timeout(TestContext& context) {
   context.expect(part2_started, "SIL starts for stopped-system timeout section");
   if (part2_started) {
     system.stop();
-    // Drain frames emitted while running using a bounded deadline and iteration limit
-    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-    std::size_t drain_count = 0;
-    while (std::chrono::steady_clock::now() < drain_deadline && drain_count < 100 &&
-           system.receive_frame(frame, std::chrono::milliseconds(5))) {
-      ++drain_count;
-    }
     context.expect(!system.receive_frame(frame, std::chrono::milliseconds(5)),
-                   "Emitted queue is fully drained after system stop");
+                   "Emitted queue is empty after system stop");
 
     const auto stopped_start = std::chrono::steady_clock::now();
     const bool received_stopped = system.receive_frame(frame, std::chrono::milliseconds(500));
@@ -1276,13 +1339,7 @@ void test_bus_routing_smu_to_ebs(TestContext& context) {
   context.expect(status_received,
                  "EBS receives frames routed from SMU and enters nominal with speed 3");
   if (status_received) {
-    context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                   "ASNode is closed when EBS receives frames from SMU routing");
-    context.expect(system.output(OutputId::EbsValve1Engaged) == 0U &&
-                       system.output(OutputId::EbsValve2Engaged) == 0U,
-                   "Both valves released when EBS receives frames from SMU routing");
-    context.expect(system.output(OutputId::EbsFaultCode) == 0U,
-                   "Fault code is 0 when EBS receives frames from SMU routing");
+    expect_ebs_nominal_outputs(context, system, "SMU routing");
   }
 
   // In addition, frames written by SMU must be observable in the monitor queue
@@ -1312,7 +1369,7 @@ void test_bus_and_external_delivery(TestContext& context) {
   Frame smu_frame{};
   const bool smu_observed = wait_for_matching_frame(
       system, raceup::sil::can_id::SmuSense,
-      [](const Frame& f) { return f.dlc == 3U && f.data[0] == 50U; }, smu_frame);
+      [](const Frame& f) { return is_smu_sense_frame(f, 50U, 50U, 0U); }, smu_frame);
   context.expect(smu_observed, "SMU frames are observable through receive_frame");
 
   // 2. EBS frames are observable through receive_frame()
@@ -1331,13 +1388,12 @@ void test_bus_and_external_delivery(TestContext& context) {
   Frame nominal_status{};
   const bool nominal_reached = wait_for_matching_frame(
       system, raceup::sil::can_id::EbsStatus,
-      [](const Frame& f) {
-        return f.dlc == 5U && f.data[0] == 1U && f.data[3] == 0U;
-      },
+      [](const Frame& f) { return is_ebs_nominal_frame(f); },
       nominal_status);
   context.expect(nominal_reached, "EBS input queue delivers frames and processes them concurrently with SMU");
-  context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
-                 "EBS closes ASNode with valid frames delivered to input queue");
+  if (nominal_reached) {
+    expect_ebs_nominal_outputs(context, system, "external delivery");
+  }
 
   system.stop();
 }
@@ -1388,17 +1444,14 @@ void test_queue_buffer_overflow(TestContext& context) {
   // Phase 2 overload: let SMU and EBS emit another ~80 frames
   std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
-  // Stop the system cleanly so no further frames are produced
-  system.stop();
-
-  // Read buffered frames from the monitor queue, capping drain loop at 65 reads.
+  // Read buffered frames from the monitor queue before stop(), capping drain loop at 65 reads.
   // Over ~160 frames were produced, but capacity is capped at 64.
   // Exactly 64 frames must be retained, and the oldest (50% throttle) must be discarded.
   std::uint32_t count = 0U;
   bool any_old_50_pct = false;
   bool found_new_75_pct = false;
   Frame frame{};
-  while (count < 65U && system.receive_frame(frame, std::chrono::milliseconds(5))) {
+  while (count < 65U && system.receive_frame(frame, std::chrono::milliseconds(2))) {
     ++count;
     if (frame.id == raceup::sil::can_id::SmuSense) {
       if (frame.data[0] == 50U) {
@@ -1409,6 +1462,9 @@ void test_queue_buffer_overflow(TestContext& context) {
       }
     }
   }
+
+  // Stop the system cleanly so threads join and remaining state is cleared
+  system.stop();
 
   context.expect(count == 64U, "Emitted monitor queue enforces 64-element capacity limit under overload");
   context.expect(!any_old_50_pct, "Oldest frames (50% throttle) were discarded from monitor queue");
@@ -1459,9 +1515,11 @@ void test_continuous_publishing(TestContext& context) {
 int main() {
   TestContext context;
   test_lifecycle(context);
+  test_lifecycle_restart_clears_state(context);
   test_smu_nominal(context);
   test_smu_track_short_and_recovery(context);
   test_smu_implausibility_and_recovery(context);
+  test_smu_threshold_boundaries_and_pedal_clamping(context);
   test_ebs_nominal_and_stale_input(context);
   test_ebs_requires_ready_to_drive(context);
   test_ebs_brake_request_and_mission_finished(context);
@@ -1471,6 +1529,8 @@ int main() {
   test_ebs_hydraulic_pressure_and_coherency(context);
   test_ebs_nominal_maintained_with_refresh(context);
   test_ebs_sensor_faults(context);
+  test_ebs_speed_limit_and_recovery(context);
+  test_ebs_short_dlc_frame_rejected(context);
   test_receive_frame_timeout(context);
   test_bus_routing_smu_to_ebs(context);
   test_bus_and_external_delivery(context);

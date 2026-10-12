@@ -52,6 +52,10 @@ SilSystem::SilSystem() : impl_(std::make_unique<Impl>()) {}
 SilSystem::~SilSystem() { stop(); }
 
 bool SilSystem::start() {
+  if (active_system != nullptr && active_system != this) {
+    return false;
+  }
+
   if (impl_->running.exchange(true)) {
     return true;
   }
@@ -90,11 +94,9 @@ bool SilSystem::start() {
 }
 
 void SilSystem::stop() {
-  if (!impl_->running.exchange(false)) {
+  if (!impl_->running.load() || impl_->stop_requested.exchange(true)) {
     return;
   }
-
-  impl_->stop_requested.store(true);
 
   // wake up any threads waiting for a frame to be emitted so they can exit
   {
@@ -108,9 +110,20 @@ void SilSystem::stop() {
   if (impl_->ebs_thread.joinable()) {
     impl_->ebs_thread.join();
   }
+
+  // Clear queues and reset actuator outputs to prevent stale frame consumption on restart
+  {
+    std::lock_guard<std::mutex> lock(impl_->state.mutex);
+    impl_->state.ebs_input.clear();
+    impl_->state.emitted.clear();
+    impl_->state.outputs.fill(0U);
+  }
+
   if (active_system == this) {
     active_system = nullptr;
   }
+
+  impl_->running.store(false);
 }
 
 bool SilSystem::running() const { return impl_->running.load(); }
@@ -125,7 +138,7 @@ void SilSystem::set_sensor(const SensorId id, const std::uint16_t value) {
 }
 
 std::uint16_t SilSystem::output(const OutputId id) const {
-    if (id >= OutputId::Count) {
+  if (id >= OutputId::Count) {
     return 0U;
   }
   std::lock_guard<std::mutex> lock(impl_->state.mutex);
@@ -137,13 +150,11 @@ void SilSystem::send_frame(const Frame& frame) {
   // To guarantee strong exception safety and avoid partial modification of the queue on memory allocation failure (std::bad_alloc)
   // the new frame is inserted before enforcing the capacity limit.
   // So, a failed insertion leaves the queue unchanged and no frames are lost.
-  
   impl_->state.ebs_input.push_back(frame);
-  
+
   if (impl_->state.ebs_input.size() > kQueueCapacity) {
     impl_->state.ebs_input.pop_front();
   }
-
 }
 
 bool SilSystem::receive_frame(Frame& frame,
@@ -157,13 +168,13 @@ bool SilSystem::receive_frame(Frame& frame,
   if (!success || impl_->state.emitted.empty()) {
     return false;
   }
-  frame = std::move(impl_->state.emitted.front());
+  frame = impl_->state.emitted.front();
   impl_->state.emitted.pop_front();
   return true;
 }
 
 std::uint16_t SilSystem::read_sensor(const SensorId id) const {
-    if (id >= SensorId::Count) {
+  if (id >= SensorId::Count) {
     return 0U;
   }
   std::lock_guard<std::mutex> lock(impl_->state.mutex);
@@ -173,7 +184,7 @@ std::uint16_t SilSystem::read_sensor(const SensorId id) const {
 bool SilSystem::try_read(const Ecu ecu, Frame& frame) {
   std::lock_guard<std::mutex> lock(impl_->state.mutex);
   if (ecu == Ecu::Ebs && !impl_->state.ebs_input.empty()) {
-    frame = std::move(impl_->state.ebs_input.front());
+    frame = impl_->state.ebs_input.front();
     impl_->state.ebs_input.pop_front();
     return true;
   }
@@ -185,7 +196,7 @@ void SilSystem::write(const Ecu ecu, const Frame& frame) {
   // To guarantee strong exception safety and avoid partial modification of the queues on memory allocation failure (std::bad_alloc)
   // insert into all destination queues before discarding old frames to enforce capacity limits.
   // If the second insertion fails, roll back the first insertion
-  
+
   auto& emitted = impl_->state.emitted;
   auto& ebs_input = impl_->state.ebs_input;
 
@@ -198,7 +209,7 @@ void SilSystem::write(const Ecu ecu, const Frame& frame) {
     } catch (...) {
       // undo the successful insertion into the monitor queue
       emitted.pop_back();
-      throw;  
+      throw;
     }
   }
 
@@ -209,12 +220,11 @@ void SilSystem::write(const Ecu ecu, const Frame& frame) {
     ebs_input.pop_front();
   }
   impl_->state.emitted_available.notify_one();
-  
 }
 
 void SilSystem::write_output(const Ecu /*ecu*/, const OutputId id,
                              const std::uint16_t value) {
-    if (id >= OutputId::Count) {
+  if (id >= OutputId::Count) {
     return;
   }
   std::lock_guard<std::mutex> lock(impl_->state.mutex);
