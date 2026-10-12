@@ -8,6 +8,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 namespace raceup::sil {
 namespace {
@@ -57,27 +58,34 @@ bool SilSystem::start() {
 
   active_system = this;
   impl_->stop_requested.store(false);
-  smu::reset();
-  ebs::reset();
 
-  impl_->smu_thread = std::thread([this] {
-    auto next = std::chrono::steady_clock::now();
-    while (!impl_->stop_requested.load()) {
-      next += kCyclePeriod;
-      smu::run_cycle();
-      std::this_thread::sleep_until(next);
-    }
-  });
+  try {  
+    smu::reset();
+    ebs::reset();
 
-  impl_->ebs_thread = std::thread([this] {
-    auto next = std::chrono::steady_clock::now();
-    while (!impl_->stop_requested.load()) {
-      next += kCyclePeriod;
-      ebs::run_cycle();
-      std::this_thread::sleep_until(next);
-    }
-  });
+    impl_->smu_thread = std::thread([this] {
+      auto next = std::chrono::steady_clock::now();
+      while (!impl_->stop_requested.load()) {
+        next += kCyclePeriod;
+        smu::run_cycle();
+        std::this_thread::sleep_until(next);
+      }
+    });
 
+    impl_->ebs_thread = std::thread([this] {
+      auto next = std::chrono::steady_clock::now();
+      while (!impl_->stop_requested.load()) {
+        next += kCyclePeriod;
+        ebs::run_cycle();
+        std::this_thread::sleep_until(next);
+      }
+    });
+  } catch (...) {
+    // if any of the threads fail to start (e.g. std::system_error), 
+    // clean up and report the failure to the caller
+    stop();
+    return false;
+  }   
   return true;
 }
 
@@ -108,8 +116,6 @@ void SilSystem::stop() {
 bool SilSystem::running() const { return impl_->running.load(); }
 
 void SilSystem::set_sensor(const SensorId id, const std::uint16_t value) {
-  // TODO(candidate): protect state.sensors with state.mutex and store value.
-  // SensorId::Count is not a valid sensor and does not need to be accepted.
   if (id >= SensorId::Count) {
     return;
   }
@@ -119,21 +125,18 @@ void SilSystem::set_sensor(const SensorId id, const std::uint16_t value) {
 }
 
 std::uint16_t SilSystem::output(const OutputId id) const {
-  // TODO(candidate): protect state.outputs with state.mutex and return the
-  // requested value.
+    if (id >= OutputId::Count) {
+    return 0U;
+  }
   std::lock_guard<std::mutex> lock(impl_->state.mutex);
   return impl_->state.outputs[output_index(id)];
 }
 
 void SilSystem::send_frame(const Frame& frame) {
-  // TODO(candidate): protect state.ebs_input with state.mutex and enqueue the
-  // frame. If the queue reaches kQueueCapacity, discard the oldest input
-  // before adding the new one.
-  
   std::lock_guard<std::mutex> lock(impl_->state.mutex);
-  // To guarantee strong exception safety and avoid failures on memory allocation (std::bad_alloc)
+  // To guarantee strong exception safety and avoid partial modification of the queue on memory allocation failure (std::bad_alloc)
   // the new frame is inserted before enforcing the capacity limit.
-  // So, if memory allocation fails, the queue is left completely unmodified and no frames are lost.
+  // So, a failed insertion leaves the queue unchanged and no frames are lost.
   
   impl_->state.ebs_input.push_back(frame);
   
@@ -145,9 +148,6 @@ void SilSystem::send_frame(const Frame& frame) {
 
 bool SilSystem::receive_frame(Frame& frame,
                               const std::chrono::milliseconds timeout) {
-  // TODO(candidate): acquire state.mutex with a std::unique_lock and wait on
-  // state.emitted_available until state.emitted is non-empty or timeout
-  // expires. On success, move the oldest frame to frame.
   std::unique_lock<std::mutex> lock(impl_->state.mutex);
   // wait_for with a predicate is used to avoid spurious wakeups
   // stop_requested is checked to avoid waiting if the system is stopped while waiting for a frame
@@ -163,16 +163,14 @@ bool SilSystem::receive_frame(Frame& frame,
 }
 
 std::uint16_t SilSystem::read_sensor(const SensorId id) const {
-  // TODO(candidate): protect state.sensors with state.mutex and return the
-  // requested value.
+    if (id >= SensorId::Count) {
+    return 0U;
+  }
   std::lock_guard<std::mutex> lock(impl_->state.mutex);
   return impl_->state.sensors[sensor_index(id)];
 }
 
 bool SilSystem::try_read(const Ecu ecu, Frame& frame) {
-  // TODO(candidate): protect state.ebs_input with state.mutex. Only Ecu::Ebs
-  // has an input queue in this exercise. If it is empty, return false;
-  // otherwise pop its oldest frame.
   std::lock_guard<std::mutex> lock(impl_->state.mutex);
   if (ecu == Ecu::Ebs && !impl_->state.ebs_input.empty()) {
     frame = std::move(impl_->state.ebs_input.front());
@@ -183,31 +181,42 @@ bool SilSystem::try_read(const Ecu ecu, Frame& frame) {
 }
 
 void SilSystem::write(const Ecu ecu, const Frame& frame) {
-  // TODO(candidate): protect both queues with state.mutex. Every ECU frame
-  // goes to state.emitted. A frame written by the SMU must also be copied to
-  // state.ebs_input. Keep both queues bounded by kQueueCapacity, then notify
-  // waiting test code through state.emitted_available.
   std::lock_guard<std::mutex> lock(impl_->state.mutex);
-  // To guarantee strong exception safety and avoid failures on memory allocation (std::bad_alloc)
-  // the new frame is inserted before enforcing the capacity limit.
-  // So, if memory allocation fails, the queue is left completely unmodified and no frames are lost.
-  impl_->state.emitted.push_back(frame);
+  // To guarantee strong exception safety and avoid partial modification of the queues on memory allocation failure (std::bad_alloc)
+  // insert into all destination queues before discarding old frames to enforce capacity limits.
+  // If the second insertion fails, roll back the first insertion
+  
+  auto& emitted = impl_->state.emitted;
+  auto& ebs_input = impl_->state.ebs_input;
+
+  // if this insertion fails, neither queue has been modified, and the exception will propagate to the caller
+  emitted.push_back(frame);
+
   if (ecu == Ecu::Smu) {
-    impl_->state.ebs_input.push_back(frame);
+    try {
+      ebs_input.push_back(frame);
+    } catch (...) {
+      // undo the successful insertion into the monitor queue
+      emitted.pop_back();
+      throw;  
+    }
   }
-  // Enforce the capacity limit on both queues.
-  if (impl_->state.emitted.size() > kQueueCapacity) {
-    impl_->state.emitted.pop_front();
+
+  if (emitted.size() > kQueueCapacity) {
+    emitted.pop_front();
   }
-  if (impl_->state.ebs_input.size() > kQueueCapacity) {
-    impl_->state.ebs_input.pop_front();
+  if (ebs_input.size() > kQueueCapacity) {
+    ebs_input.pop_front();
   }
   impl_->state.emitted_available.notify_one();
+  
 }
 
 void SilSystem::write_output(const Ecu /*ecu*/, const OutputId id,
                              const std::uint16_t value) {
-  // TODO(candidate): protect state.outputs with state.mutex and store value.
+    if (id >= OutputId::Count) {
+    return;
+  }
   std::lock_guard<std::mutex> lock(impl_->state.mutex);
   impl_->state.outputs[output_index(id)] = value;
 }
