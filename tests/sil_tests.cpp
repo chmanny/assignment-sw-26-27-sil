@@ -233,6 +233,29 @@ void test_ebs_brake_request(TestContext& context) {
   system.stop();
 }
 
+void test_ebs_invalid_pneumatic_pressure(TestContext& context) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+  system.start();
+
+  system.send_frame(vehicle_status(false, true, 0U));
+  system.send_frame(brake_pressure(40U, 40U, 8U, 8U));
+  system.send_frame(ebs_command(false, false));
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  context.expect(system.output(OutputId::EbsAsNodeClosed) == 1U,
+                 "EBS is nominal before a live pneumatic pressure change");
+
+  system.send_frame(brake_pressure(40U, 40U, 0U, 0U));    // left and right pneumatic pressures drop to zero
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  context.expect(system.output(OutputId::EbsAsNodeClosed) == 0U,
+                 "EBS opens ASNode after a live pneumatic pressure drop");
+  context.expect(system.output(OutputId::EbsValve1Engaged) == 1U &&
+                     system.output(OutputId::EbsValve2Engaged) == 1U,
+                 "EBS engages both valves after a live pneumatic pressure drop");
+  system.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -243,7 +266,7 @@ int main() {
   test_ebs_nominal_and_stale_input(context);
   test_ebs_requires_ready_to_drive(context);
   test_ebs_brake_request(context);
-
+  test_ebs_invalid_pneumatic_pressure(context);
   if (context.failures != 0) {
     std::printf("%d test assertion(s) failed\n", context.failures);
     return 1;
