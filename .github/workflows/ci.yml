@@ -16,7 +16,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Ninja
-        run: sudo apt-get update && sudo apt-get install --yes ninja-build
+        run: sudo apt-get update && sudo apt-get install --yes ninja-build g++-13
 
       - name: SIL workflow
+        env:
+          CXX: g++-13
         run: cmake --workflow --preset sil
