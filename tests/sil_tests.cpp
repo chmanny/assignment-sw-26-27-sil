@@ -1410,7 +1410,7 @@ void test_queue_buffer_overflow(TestContext& context) {
   // This test exercises the monitor (emitted) queue, not the EBS input queue.
   // The monitor queue holds frames produced by both ECUs and is observed via receive_frame().
   // Its capacity is 64 frames; when full, the oldest frame is discarded to make room for the newest.
-  // Queue contents survive system.stop(), allowing us to drain and inspect them afterwards.
+  // stop() clears the queues, so the monitor queue must be drained before stopping.
 
   // Confirm phase 1 (50% throttle) started by waiting for an initial frame
   Frame initial_frame{};
@@ -1424,34 +1424,44 @@ void test_queue_buffer_overflow(TestContext& context) {
     return;
   }
 
-  // Phase 1 overload: let SMU and EBS emit ~80 frames with nominal inputs
+  // Phase 1 overload: let SMU and EBS emit ~80 frames with nominal inputs (50% throttle)
   std::this_thread::sleep_for(std::chrono::milliseconds(400));
 
-  // Switch to 75% throttle and confirm phase 2 started before measuring overload retention
+  // Switch to 75% throttle and confirm phase 2 started via actuator output
+  // (without draining the monitor queue, so phase 1 frames must be evicted by capacity limit)
   system.set_sensor(SensorId::SmuApps1Raw, 3250U);
   system.set_sensor(SensorId::SmuApps2Raw, 2750U);
-  Frame phase2_frame{};
-  const bool phase2_started = wait_for_matching_frame(
-      system, raceup::sil::can_id::SmuSense,
-      [](const Frame& f) { return f.dlc == 3U && f.data[0] == 75U; },
-      phase2_frame);
-  context.expect(phase2_started, "Phase 2 confirmed started with 75% throttle frame");
+  bool phase2_started = false;
+  const auto phase2_deadline = std::chrono::steady_clock::now() + kWait;
+  while (std::chrono::steady_clock::now() < phase2_deadline) {
+    if (system.output(OutputId::SmuThrottlePercent) == 75U) {
+      phase2_started = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  context.expect(phase2_started, "Phase 2 confirmed started with 75% throttle");
   if (!phase2_started) {
     system.stop();
     return;
   }
 
-  // Phase 2 overload: let SMU and EBS emit another ~80 frames
-  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  // Phase 2 overload: let SMU and EBS emit another ~120 frames
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
 
-  // Read buffered frames from the monitor queue before stop(), capping drain loop at 65 reads.
-  // Over ~160 frames were produced, but capacity is capped at 64.
-  // Exactly 64 frames must be retained, and the oldest (50% throttle) must be discarded.
+  // Drain the monitor queue before stop() (stop() clears the queues).
+  // The ECU threads are still running while we drain, so a few new frames may be
+  // pushed during the drain itself: an exact "== 64" check would be racy.
+  // Instead, assert that the count is bounded: an unbounded queue would yield ~200 frames,
+  // while a 64-element queue yields 64 plus at most a few frames produced during the drain.
+  constexpr std::uint32_t kMaxDrainReads = 200U;
+  constexpr std::uint32_t kDrainTolerance = 6U;
   std::uint32_t count = 0U;
   bool any_old_50_pct = false;
   bool found_new_75_pct = false;
   Frame frame{};
-  while (count < 65U && system.receive_frame(frame, std::chrono::milliseconds(2))) {
+  while (count < kMaxDrainReads &&
+         system.receive_frame(frame, std::chrono::milliseconds(0))) {
     ++count;
     if (frame.id == raceup::sil::can_id::SmuSense) {
       if (frame.data[0] == 50U) {
@@ -1466,7 +1476,10 @@ void test_queue_buffer_overflow(TestContext& context) {
   // Stop the system cleanly so threads join and remaining state is cleared
   system.stop();
 
-  context.expect(count == 64U, "Emitted monitor queue enforces 64-element capacity limit under overload");
+  context.expect(count >= 64U && count <= 64U + kDrainTolerance,
+                 "Emitted monitor queue enforces 64-element capacity limit under overload "
+                 "(drained {} frames, expected 64..{})",
+                 count, 64U + kDrainTolerance);
   context.expect(!any_old_50_pct, "Oldest frames (50% throttle) were discarded from monitor queue");
   context.expect(found_new_75_pct, "Newest frames (75% throttle) survived in monitor queue");
 }

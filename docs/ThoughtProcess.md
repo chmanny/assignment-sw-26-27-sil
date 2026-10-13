@@ -19,7 +19,7 @@ Given that the SIL environment is designed to simulate real-time ECU behavior, i
 
 - Frames written by the SMU are pushed to the test monitor queue and simultaneously duplicated into the EBS input queue. Frames emitted by the EBS are delivered exclusively to the monitor queue, preventing self-loopback into the EBS input stage. External frames injected via `send_frame` enter the EBS input queue directly.
 - Both the EBS input queue and the monitor queue are strictly bounded by `kQueueCapacity = 64`, so under high bus load, the oldest frames are discarded to guarantee bounded memory consumption.
-- To avoid unrecoverable state corruption upon memory allocation failure (`std::bad_alloc`), new frames are inserted into queues &&before** popping older elements; in `write()`, where a frame is routed across two distinct queues, a `try-catch` mechanism undoes the first push (`emitted.pop_back()`) whether the second push fails, ensuring strong exception guarantees across both data structures.
+- To avoid unrecoverable state corruption upon memory allocation failure (`std::bad_alloc`), new frames are inserted into queues **before** popping older elements; in `write()`, where a frame is routed across two distinct queues, a `try-catch` mechanism undoes the first push (`emitted.pop_back()`) whether the second push fails, ensuring strong exception guarantees across both data structures.
 - Upon `stop()`, all queues are cleared and actuator output tables are reset to zero. This guarantees that restarting a `SilSystem` instance does not suffer from stale frame leakage from prior runs.
 
 ## 3. Test Architecture
