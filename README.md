@@ -31,14 +31,14 @@ Implement in your fork:
 3. A CI workflow in `.github/workflows/ci.yml` that builds and runs the tests.
 4. Any small lifecycle or test-harness changes needed for a reliable solution.
 5. A concise explanation of the main design choices in
-   `docs/ThoughProcess.md`.
+   [`docs/ThoughtProcess.md`](docs/ThoughtProcess.md).
 
 The public tests are only a starting point. Add tests for the safety behavior
 listed below. At least three focused tests must be added, and at least one must
 change a sensor value or inject a bus frame while the SIL is already running
 and verify the resulting state transition.
 
-Please use `docs/ThoughProcess.md` to explain the synchronization strategy,
+Please use [`docs/ThoughtProcess.md`](docs/ThoughtProcess.md) to explain the synchronization strategy,
 communication routing, test approach, and relevant trade-offs. The document
 does not need to be long; it should make the reasoning behind the solution
 easy to review.
