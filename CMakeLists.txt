@@ -44,4 +44,4 @@ target_compile_options(sil_tests PRIVATE
 target_link_libraries(sil_tests PRIVATE Threads::Threads)
 
 add_test(NAME sil_tests COMMAND sil_tests)
-set_tests_properties(sil_tests PROPERTIES TIMEOUT 15)
+set_tests_properties(sil_tests PROPERTIES TIMEOUT 30)

@@ -3,22 +3,55 @@ name: SIL
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   build-and-test:
+    name: Build and Test
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Ninja
+      - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install --yes ninja-build g++-13
 
       - name: SIL workflow
         env:
           CXX: g++-13
+        run: cmake --workflow --preset sil
+
+  thread-sanitizer:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Workaround for Linux kernel 6.5+ / Ubuntu runner ASLR entropy issue.
+      # High mmap_rnd_bits (>28) causes ThreadSanitizer to abort on startup
+      # with "FATAL: ThreadSanitizer: unexpected memory mapping" due to fixed shadow memory layout.
+      - name: Workaround ASLR for ThreadSanitizer
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install --yes ninja-build g++-13
+
+      # -fno-omit-frame-pointer retains frame pointers so ThreadSanitizer can unwind call stacks
+      # reliably with accurate line numbers, even under Release mode (-O3) optimizations.
+      - name: SIL workflow with ThreadSanitizer
+        env:
+          CXX: g++-13
+          CXXFLAGS: "-fsanitize=thread -g -fno-omit-frame-pointer"
+          LDFLAGS: "-fsanitize=thread"
+          TSAN_OPTIONS: "second_deadlock_stack=1 second_deadlock_stack=1"
         run: cmake --workflow --preset sil
