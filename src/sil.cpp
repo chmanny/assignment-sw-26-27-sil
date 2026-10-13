@@ -63,6 +63,14 @@ bool SilSystem::start() {
   active_system = this;
   impl_->stop_requested.store(false);
 
+  // clear queues and reset actuator outputs so every start begins with a clean slate
+  {
+    std::lock_guard<std::mutex> lock(impl_->state.mutex);
+    impl_->state.ebs_input.clear();
+    impl_->state.emitted.clear();
+    impl_->state.outputs.fill(0U);
+  }
+
   try {  
     smu::reset();
     ebs::reset();
@@ -98,11 +106,8 @@ void SilSystem::stop() {
     return;
   }
 
-  // wake up any threads waiting for a frame to be emitted so they can exit
-  {
-    std::lock_guard<std::mutex> lock(impl_->state.mutex);
-    impl_->state.emitted_available.notify_all();
-  }
+  // wake up any threads waiting for a frame without holding the mutex
+  impl_->state.emitted_available.notify_all();
 
   if (impl_->smu_thread.joinable()) {
     impl_->smu_thread.join();
@@ -111,13 +116,9 @@ void SilSystem::stop() {
     impl_->ebs_thread.join();
   }
 
-  // Clear queues and reset actuator outputs to prevent stale frame consumption on restart
-  {
-    std::lock_guard<std::mutex> lock(impl_->state.mutex);
-    impl_->state.ebs_input.clear();
-    impl_->state.emitted.clear();
-    impl_->state.outputs.fill(0U);
-  }
+  // Note: queues and outputs are intentionally NOT cleared here.
+  // They serve as a flight recorder that callers can inspect after the system has stopped.
+  // However, state is cleared on the next start() to isolate subsequent runs.
 
   if (active_system == this) {
     active_system = nullptr;
@@ -192,33 +193,36 @@ bool SilSystem::try_read(const Ecu ecu, Frame& frame) {
 }
 
 void SilSystem::write(const Ecu ecu, const Frame& frame) {
-  std::lock_guard<std::mutex> lock(impl_->state.mutex);
   // To guarantee strong exception safety and avoid partial modification of the queues on memory allocation failure (std::bad_alloc)
   // insert into all destination queues before discarding old frames to enforce capacity limits.
   // If the second insertion fails, roll back the first insertion
+  {
+    std::lock_guard<std::mutex> lock(impl_->state.mutex);
+    auto& emitted = impl_->state.emitted;
+    auto& ebs_input = impl_->state.ebs_input;
 
-  auto& emitted = impl_->state.emitted;
-  auto& ebs_input = impl_->state.ebs_input;
+    // if this insertion fails, neither queue has been modified, and the exception will propagate to the caller
+    emitted.push_back(frame);
 
-  // if this insertion fails, neither queue has been modified, and the exception will propagate to the caller
-  emitted.push_back(frame);
+    if (ecu == Ecu::Smu) {
+      try {
+        ebs_input.push_back(frame);
+      } catch (...) {
+        // undo the successful insertion into the monitor queue
+        emitted.pop_back();
+        throw;
+      }
+    }
 
-  if (ecu == Ecu::Smu) {
-    try {
-      ebs_input.push_back(frame);
-    } catch (...) {
-      // undo the successful insertion into the monitor queue
-      emitted.pop_back();
-      throw;
+    if (emitted.size() > kQueueCapacity) {
+      emitted.pop_front();
+    }
+    if (ebs_input.size() > kQueueCapacity) {
+      ebs_input.pop_front();
     }
   }
 
-  if (emitted.size() > kQueueCapacity) {
-    emitted.pop_front();
-  }
-  if (ebs_input.size() > kQueueCapacity) {
-    ebs_input.pop_front();
-  }
+  // notify after releasing the mutex to prevent re-contention on the waiting thread
   impl_->state.emitted_available.notify_one();
 }
 

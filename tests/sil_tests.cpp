@@ -1297,14 +1297,14 @@ void test_receive_frame_timeout(TestContext& context) {
   context.expect(part2_started, "SIL starts for stopped-system timeout section");
   if (part2_started) {
     system.stop();
-    context.expect(!system.receive_frame(frame, std::chrono::milliseconds(5)),
-                   "Emitted queue is empty after system stop");
+    // Drain any frames emitted while running so the queue is empty
+    while (system.receive_frame(frame, std::chrono::milliseconds(0))) {}
 
     const auto stopped_start = std::chrono::steady_clock::now();
     const bool received_stopped = system.receive_frame(frame, std::chrono::milliseconds(500));
     const auto stopped_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - stopped_start);
-    context.expect(!received_stopped, "receive_frame returns false when system is stopped");
+    context.expect(!received_stopped, "receive_frame returns false when system is stopped and queue is empty");
     context.expect(stopped_elapsed < std::chrono::milliseconds(200),
                    "receive_frame returns promptly on stopped system without waiting for full timeout");
   }
@@ -1410,7 +1410,7 @@ void test_queue_buffer_overflow(TestContext& context) {
   // This test exercises the monitor (emitted) queue, not the EBS input queue.
   // The monitor queue holds frames produced by both ECUs and is observed via receive_frame().
   // Its capacity is 64 frames; when full, the oldest frame is discarded to make room for the newest.
-  // stop() clears the queues, so the monitor queue must be drained before stopping.
+  // Queue contents survive system.stop(), allowing us to drain and inspect them afterwards.
 
   // Confirm phase 1 (50% throttle) started by waiting for an initial frame
   Frame initial_frame{};
@@ -1449,19 +1449,17 @@ void test_queue_buffer_overflow(TestContext& context) {
   // Phase 2 overload: let SMU and EBS emit another ~120 frames
   std::this_thread::sleep_for(std::chrono::milliseconds(600));
 
-  // Drain the monitor queue before stop() (stop() clears the queues).
-  // The ECU threads are still running while we drain, so a few new frames may be
-  // pushed during the drain itself: an exact "== 64" check would be racy.
-  // Instead, assert that the count is bounded: an unbounded queue would yield ~200 frames,
-  // while a 64-element queue yields 64 plus at most a few frames produced during the drain.
-  constexpr std::uint32_t kMaxDrainReads = 200U;
-  constexpr std::uint32_t kDrainTolerance = 6U;
+  // Stop the system cleanly so threads join and no background thread is writing to the queue.
+  system.stop();
+
+  // Queue contents survive system.stop(), acting as a flight recorder for post-mortem analysis.
+  // Over ~200 frames were produced, but capacity is strictly capped at 64.
+  // Because the system is stopped, no background thread is writing to the queue.
   std::uint32_t count = 0U;
   bool any_old_50_pct = false;
   bool found_new_75_pct = false;
   Frame frame{};
-  while (count < kMaxDrainReads &&
-         system.receive_frame(frame, std::chrono::milliseconds(0))) {
+  while (system.receive_frame(frame, std::chrono::milliseconds(0))) {
     ++count;
     if (frame.id == raceup::sil::can_id::SmuSense) {
       if (frame.data[0] == 50U) {
@@ -1473,13 +1471,7 @@ void test_queue_buffer_overflow(TestContext& context) {
     }
   }
 
-  // Stop the system cleanly so threads join and remaining state is cleared
-  system.stop();
-
-  context.expect(count >= 64U && count <= 64U + kDrainTolerance,
-                 "Emitted monitor queue enforces 64-element capacity limit under overload "
-                 "(drained {} frames, expected 64..{})",
-                 count, 64U + kDrainTolerance);
+  context.expect(count == 64U, "Emitted monitor queue enforces 64-element capacity limit under overload");
   context.expect(!any_old_50_pct, "Oldest frames (50% throttle) were discarded from monitor queue");
   context.expect(found_new_75_pct, "Newest frames (75% throttle) survived in monitor queue");
 }
