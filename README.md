@@ -91,6 +91,31 @@ on pushes and pull requests, perform a clean configure/build/test operation,
 and return a non-zero status when the tests fail. It must not depend on local
 build artifacts, hardware, secrets, or manual steps.
 
+
+### Running via Docker/Podman
+To ensure a reproducible build environment, the entire build process and test suite can be run inside a Docker or Podman container. 
+
+Run the following command from the root of the repository:
+
+Using Podman:
+```bash
+podman run --rm -v "$PWD":/workspace -w /workspace ubuntu:24.04 bash -c "apt-get update && apt-get install -y cmake ninja-build g++ && cmake --workflow --preset sil"
+```
+
+>[!NOTE]
+>If you are using a RHEL-based distribution (Fedora, CentOS) and have SELinux enabled, you may need to [adjust the volume mount options](https://docs.docker.com/engine/storage/bind-mounts/#configure-the-selinux-label) to avoid permission issues when running the container, by adding `:z` or `:Z` to the volume mount, like so:
+>```bash
+>podman run --rm -v "$PWD":/workspace:z -w /workspace ubuntu:24.04 bash -c "apt-get update && apt-get install -y cmake ninja-build g++ && cmake --workflow --preset sil"
+>```
+>Alternatively, you can run the container with elevated privileges using `--privileged` or temporarily disable SELinux using `sudo setenforce 0`, but this is generally discouraged for security reasons.
+
+
+Using Docker:
+```bash
+docker run --rm -v "$PWD":/workspace -w /workspace ubuntu:24.04 bash -c "apt-get update && apt-get install -y cmake ninja-build g++ && cmake --workflow --preset sil"
+```
+
+
 ## Simulator contract
 
 The fixed platform contract is in `given/ecu_api.hpp`:
