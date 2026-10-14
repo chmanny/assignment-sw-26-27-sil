@@ -6,6 +6,7 @@
 #include <format>
 #include <thread>
 #include <utility>
+#include <string_view>
 
 namespace {
 
@@ -134,20 +135,6 @@ bool wait_for_ebs_status_with_inputs(
             ebs_command(inputs.brake_request, inputs.mission_finished));
       },
       predicate, result, timeout, refresh_interval);
-}
-
-template <typename Predicate>
-bool wait_for_ebs_status_with_refresh(
-    SilSystem& system, const std::uint8_t left, const std::uint8_t right,
-    Predicate predicate, Frame& result,
-    const std::chrono::milliseconds timeout = std::chrono::milliseconds(800),
-    const std::chrono::milliseconds refresh_interval =
-        std::chrono::milliseconds(40)) {
-  EbsInputs inputs{};
-  inputs.pneumatic_left = left;
-  inputs.pneumatic_right = right;
-  return wait_for_ebs_status_with_inputs(system, inputs, predicate, result,
-                                         timeout, refresh_interval);
 }
 
 bool is_smu_sense_frame(const Frame& f, const std::uint8_t throttle,
@@ -280,8 +267,8 @@ void test_lifecycle_restart_clears_state(TestContext& context) {
   context.expect(!system.running(), "SIL stops after run 1");
 
   // Restart the system without publishing any CAN frames.
-  // Because stop() clears ebs_input, emitted, and outputs, the EBS must NOT consume
-  // stale frames from the previous run; it must immediately report communication fault 1.
+  // Because stop() clears the input queue (ebs_input) and start() clears the emitted queue and outputs,
+  // the EBS must NOT consume stale frames from the previous run; it must immediately report communication fault 1.
   context.expect(system.start(), "SIL restarts cleanly in run 2");
   Frame safe_frame{};
   const bool safe_received = wait_for_matching_frame(
@@ -293,6 +280,35 @@ void test_lifecycle_restart_clears_state(TestContext& context) {
   if (safe_received) {
     expect_ebs_safe_outputs(context, system, 1U, "restart without inputs");
   }
+  system.stop();
+}
+
+void test_lifecycle_preload_inputs_before_start(TestContext& context) {
+  SilSystem system;
+  configure_nominal_inputs(system);
+
+  // Pre-load the EBS input queue while the system is stopped.
+  // Frames sent before start() must persist into the run.
+  system.send_frame(vehicle_status(false, true, 0U));
+  system.send_frame(brake_pressure(40U, 40U, 8U, 8U));
+  system.send_frame(ebs_command(false, false));
+
+  const bool started = system.start();
+  context.expect(started, "SIL starts with preloaded inputs");
+  if (!started) {
+    return;
+  }
+
+  Frame first_status{};
+  const bool received = wait_for_matching_frame(
+      system, raceup::sil::can_id::EbsStatus,
+      [](const Frame& f) { return is_ebs_nominal_frame(f); }, first_status);
+  context.expect(received,
+                 "First EBS status is nominal because preloaded frames were consumed");
+  if (received) {
+    expect_ebs_nominal_outputs(context, system, "preloaded inputs");
+  }
+
   system.stop();
 }
 
@@ -1521,6 +1537,7 @@ int main() {
   TestContext context;
   test_lifecycle(context);
   test_lifecycle_restart_clears_state(context);
+  test_lifecycle_preload_inputs_before_start(context);
   test_smu_nominal(context);
   test_smu_track_short_and_recovery(context);
   test_smu_implausibility_and_recovery(context);

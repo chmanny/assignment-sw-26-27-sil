@@ -109,11 +109,20 @@ podman run --rm -v "$PWD":/workspace -w /workspace ubuntu:24.04 bash -c "apt-get
 >```
 >Alternatively, you can run the container with elevated privileges using `--privileged` or temporarily disable SELinux using `sudo setenforce 0`, but this is generally discouraged for security reasons.
 
-
 Using Docker:
 ```bash
 docker run --rm -v "$PWD":/workspace -w /workspace ubuntu:24.04 bash -c "apt-get update && apt-get install -y cmake ninja-build g++ && cmake --workflow --preset sil"
 ```
+
+#### Running with ThreadSanitizer
+To run the test suite with ThreadSanitizer enabled inside Podman/Docker:
+
+```bash
+podman run --rm -v "$PWD":/workspace:z -w /workspace ubuntu:24.04 bash -c "apt-get update && apt-get install -y cmake ninja-build g++ && CXXFLAGS='-fsanitize=thread -g -fno-omit-frame-pointer' LDFLAGS='-fsanitize=thread' TSAN_OPTIONS='second_deadlock_stack=1' cmake --workflow --preset sil"
+```
+
+>[!NOTE]
+>On Linux kernel 6.5+ hosts, ThreadSanitizer may abort on startup with `FATAL: ThreadSanitizer: unexpected memory mapping` due to ASLR entropy. You can resolve this either by running with `setarch x86_64 -R` or by temporarily adjusting `mmap_rnd_bits` on the host.
 
 
 ## Simulator contract

@@ -63,10 +63,10 @@ bool SilSystem::start() {
   active_system = this;
   impl_->stop_requested.store(false);
 
-  // clear queues and reset actuator outputs so every start begins with a clean slate
+  // Clear the emitted queue and reset actuator outputs so every start begins with a clean slate.
+  // The input queue is intentionally not cleared here to allow preloading frames before start().
   {
     std::lock_guard<std::mutex> lock(impl_->state.mutex);
-    impl_->state.ebs_input.clear();
     impl_->state.emitted.clear();
     impl_->state.outputs.fill(0U);
   }
@@ -102,8 +102,14 @@ bool SilSystem::start() {
 }
 
 void SilSystem::stop() {
-  if (!impl_->running.load() || impl_->stop_requested.exchange(true)) {
+  if (!impl_->running.load()) {
     return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(impl_->state.mutex);
+    if (impl_->stop_requested.exchange(true)) {
+      return;
+    }
   }
 
   // wake up any threads waiting for a frame without holding the mutex
@@ -116,9 +122,13 @@ void SilSystem::stop() {
     impl_->ebs_thread.join();
   }
 
-  // Note: queues and outputs are intentionally NOT cleared here.
-  // They serve as a flight recorder that callers can inspect after the system has stopped.
-  // However, state is cleared on the next start() to isolate subsequent runs.
+  // Clear the input queue to prevent leftover frames from leaking into the next run.
+  // The emitted queue and actuator outputs are intentionally NOT cleared here so callers
+  // can inspect them as a flight recorder; they are cleared on the next start().
+  {
+    std::lock_guard<std::mutex> lock(impl_->state.mutex);
+    impl_->state.ebs_input.clear();
+  }
 
   if (active_system == this) {
     active_system = nullptr;
