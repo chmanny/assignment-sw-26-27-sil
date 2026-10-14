@@ -53,5 +53,5 @@ jobs:
           CXX: g++-13
           CXXFLAGS: "-fsanitize=thread -g -fno-omit-frame-pointer"
           LDFLAGS: "-fsanitize=thread"
-          TSAN_OPTIONS: "second_deadlock_stack=1 second_deadlock_stack=1"
+          TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
         run: cmake --workflow --preset sil
